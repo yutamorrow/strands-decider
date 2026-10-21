@@ -172,6 +172,8 @@ curl -s localhost:8000/v1/systemone \
   ```
 </details>
 
+`ask` and `serve` also read `h2oai/h2o-lightning-4b` checkpoints ([docs/h2o-lightning.md](docs/h2o-lightning.md)).
+
 ### Images
 
 Qwen3.5-2B-Base is natively multimodal. With `--vision` the server keeps its vision tower,
