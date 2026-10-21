@@ -24,11 +24,17 @@ import copy
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from .modeling import StrandsDeciderModel, apply_temperature, masked_log_softmax, pool_last_token
+from .modeling import (
+    StrandsDeciderModel,
+    apply_temperature,
+    checkpoint_dir,
+    masked_log_softmax,
+    pool_last_token,
+)
 from .prompting import (
     RenderedQuestion,
     read_choice,
@@ -51,6 +57,9 @@ from .schema import (
     derive_confidence,
     derive_score_confidence,
 )
+
+if TYPE_CHECKING:
+    from .h2o import H2OEngine
 
 
 @dataclass
@@ -558,12 +567,42 @@ def load_engine(
     device: str = "cuda",
     use_prefix_cache: bool = True,
     attn_implementation: str | None = None,
-) -> SystemOneEngine:
-    """An engine on a torch device ("cuda", "mps", "cpu"), or on MLX with `device="mlx"`."""
+    attention: str = "two-way",
+    revision: str | None = None,
+) -> SystemOneEngine | H2OEngine:
+    """An engine on a torch device ("cuda", "mps", "cpu"), or on MLX with `device="mlx"`.
+
+    An h2o-lightning checkpoint (`serve_config.json` and no decider config, see h2o.py) gives an
+    `H2OEngine` read with `attention` ("two-way" or "one-way"); `attention` is not used for a
+    strands-decider checkpoint. `revision` is the Hub revision to download (None: the default
+    branch).
+    """
+    from .h2o import ATTENTION_MODES, load_h2o_engine, resolve
+
+    if attention not in ATTENTION_MODES:
+        raise ValueError(f"attention must be one of {list(ATTENTION_MODES)}, got {attention!r}")
+    if device == "mlx" and not mlx_available():
+        raise RuntimeError(MLX_EXTRA_MESSAGE)
+    h2o_path = resolve(checkpoint, revision)
+    if h2o_path is not None:
+        if device == "mlx":
+            from .h2o_mlx import load as load_h2o_mlx
+
+            return load_h2o_mlx(h2o_path, attention)
+        return load_h2o_engine(
+            h2o_path, device=device, attention=attention, attn_implementation=attn_implementation
+        )
+    if revision is not None:
+        checkpoint = checkpoint_dir(checkpoint, revision)
     if device == "mlx":
         return load_mlx(checkpoint, EngineConfig(device="mlx", use_prefix_cache=use_prefix_cache))
     model = StrandsDeciderModel.load(checkpoint, attn_implementation=attn_implementation)
     return SystemOneEngine(model, EngineConfig(device=device, use_prefix_cache=use_prefix_cache))
+
+
+MLX_EXTRA_MESSAGE = (
+    "device 'mlx' needs Apple silicon and the mlx extra: pip install 'strands-decider[mlx]'"
+)
 
 
 def mlx_available() -> bool:
@@ -591,9 +630,7 @@ def mlx_available() -> bool:
 def load_mlx(checkpoint: str, config: EngineConfig | None = None) -> SystemOneEngine:
     """An engine with the torso on MLX (see mlx_engine.py), configured as a torch engine is."""
     if not mlx_available():
-        raise RuntimeError(
-            "device 'mlx' needs Apple silicon and the mlx extra: pip install 'strands-decider[mlx]'"
-        )
+        raise RuntimeError(MLX_EXTRA_MESSAGE)
     from .mlx_engine import load_mlx_engine
 
     return load_mlx_engine(checkpoint, config)

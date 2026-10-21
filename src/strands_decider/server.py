@@ -15,11 +15,12 @@ import time
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
+from .h2o import H2OEngine, H2OEngineConfig, is_h2o, load_h2o_engine, resolve
 from .infer import EngineConfig, SystemOneEngine, load_mlx
-from .modeling import StrandsDeciderModel
+from .modeling import StrandsDeciderModel, checkpoint_dir
 from .schema import SystemOneRequest, SystemOneResponse
 
-_engine: SystemOneEngine | None = None
+_engine: SystemOneEngine | H2OEngine | None = None
 _engine_lock = threading.Lock()
 
 
@@ -30,10 +31,26 @@ def _needs_serialisation(device: str) -> bool:
     return str(device).startswith("mps")
 
 
-def get_engine() -> SystemOneEngine:
+def get_engine() -> SystemOneEngine | H2OEngine:
     if _engine is None:  # pragma: no cover - guarded by create_app
         raise RuntimeError("engine not initialised")
     return _engine
+
+
+def _load_h2o(
+    path: str, *, device: str, attention: str, model_name: str, attn_implementation: str | None
+) -> H2OEngine:
+    if device == "mlx":
+        from .h2o_mlx import load as load_h2o_mlx
+
+        return load_h2o_mlx(path, attention, H2OEngineConfig(device="mlx", model_name=model_name))
+    return load_h2o_engine(
+        path,
+        device=device,
+        attention=attention,
+        attn_implementation=attn_implementation,
+        model_name=model_name,
+    )
 
 
 def create_app(
@@ -47,9 +64,18 @@ def create_app(
     max_batch: int = 32,
     vision: bool = False,
     max_batch_tokens: int | None = None,
+    attention: str = "two-way",
+    revision: str | None = None,
 ) -> FastAPI:
+    """The app for `checkpoint`. An h2o-lightning checkpoint (see h2o.py) is read with
+    `attention` ("two-way" or "one-way"); `attention` is not used for a strands-decider
+    checkpoint. `revision` is the Hub revision to download (None: the default branch)."""
     global _engine
+    from .h2o import ATTENTION_MODES
+    from .infer import MLX_EXTRA_MESSAGE, mlx_available
 
+    if attention not in ATTENTION_MODES:
+        raise ValueError(f"attention must be one of {list(ATTENTION_MODES)}, got {attention!r}")
     app = FastAPI(
         title="strands-decider System One",
         version="0.1.0",
@@ -71,14 +97,34 @@ def create_app(
     if vision:
         if device == "mlx":
             raise ValueError("--vision runs on torch devices (cuda, mps, cpu), not mlx")
+        if is_h2o(checkpoint, revision):
+            raise ValueError(
+                "--vision: h2o-lightning checkpoints are served text-only; image input is not supported"
+            )
         from .vision import load_vision_engine
 
-        _engine = load_vision_engine(checkpoint, config, attn_implementation=attn_implementation)
-    elif device == "mlx":
-        _engine = load_mlx(checkpoint, config)
+        _engine = load_vision_engine(
+            checkpoint if revision is None else checkpoint_dir(checkpoint, revision),
+            config,
+            attn_implementation=attn_implementation,
+        )
+    elif (h2o_path := resolve(checkpoint, revision)) is not None:
+        if device == "mlx" and not mlx_available():
+            raise RuntimeError(MLX_EXTRA_MESSAGE)
+        _engine = _load_h2o(
+            h2o_path,
+            device=device,
+            attention=attention,
+            model_name=resolved_name,
+            attn_implementation=attn_implementation,
+        )
     else:
-        model = StrandsDeciderModel.load(checkpoint, attn_implementation=attn_implementation)
-        _engine = SystemOneEngine(model, config)
+        source = checkpoint if revision is None else checkpoint_dir(checkpoint, revision)
+        if device == "mlx":
+            _engine = load_mlx(source, config)
+        else:
+            model = StrandsDeciderModel.load(source, attn_implementation=attn_implementation)
+            _engine = SystemOneEngine(model, config)
 
     # SageMaker and AgentCore Runtime call /ping and /invocations; each is the same
     # handler as the path above it.
@@ -86,14 +132,21 @@ def create_app(
     @app.get("/ping")
     def health() -> dict:
         eng = get_engine()
+        fields = (
+            eng.health_fields()
+            if isinstance(eng, H2OEngine)
+            else {
+                "base_model": eng.model.config.base_model,
+                "num_slots": eng.model.config.num_slots,
+                "max_length": eng.model.config.max_length,
+                "temperature": eng.model.config.temperature,
+            }
+        )
         return {
             "status": "ok",
             "model": eng.cfg.model_name,
             "checkpoint": checkpoint,
-            "base_model": eng.model.config.base_model,
-            "num_slots": eng.model.config.num_slots,
-            "max_length": eng.model.config.max_length,
-            "temperature": eng.model.config.temperature,
+            **fields,
             "device": eng.cfg.device,
             "prefix_cache": eng.cfg.use_prefix_cache,
             "vision": vision,
@@ -133,6 +186,8 @@ def serve(
     max_batch: int = 32,
     vision: bool = False,
     max_batch_tokens: int | None = None,
+    attention: str = "two-way",
+    revision: str | None = None,
 ) -> None:
     import uvicorn
 
@@ -145,6 +200,8 @@ def serve(
         max_batch=max_batch,
         vision=vision,
         max_batch_tokens=max_batch_tokens,
+        attention=attention,
+        revision=revision,
     )
     # Single worker: the model owns the GPU, and forking more would just duplicate it.
     uvicorn.run(app, host=host, port=port, workers=1)

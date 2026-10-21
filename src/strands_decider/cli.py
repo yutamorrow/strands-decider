@@ -51,6 +51,22 @@ def resolve_device(device: str | None) -> str:
 
 # ---------------------------------------------------------------- serve / ask
 
+_ATTENTION_HELP = (
+    "h2o-lightning checkpoints only (docs/h2o-lightning.md): two-way (the default) or one-way "
+    "attention. Not used for strands-decider checkpoints."
+)
+_REVISION_HELP = (
+    "Hub revision (branch, tag or commit) to download. Default: the repo's default branch."
+)
+
+
+def _check_attention(value: str) -> str:
+    from .h2o import ATTENTION_MODES
+
+    if value not in ATTENTION_MODES:
+        raise typer.BadParameter(f"must be one of {', '.join(ATTENTION_MODES)}")
+    return value
+
 
 @app.command("serve")
 def serve_cmd(
@@ -89,6 +105,13 @@ def serve_cmd(
         "--max-batch-tokens",
         help="Also cap one forward's padded tokens (questions x longest state + question); for long-context torsos.",
     ),
+    attention: str = typer.Option(
+        "two-way",
+        "--attention",
+        help=_ATTENTION_HELP,
+        callback=_check_attention,
+    ),
+    revision: str | None = typer.Option(None, "--revision", help=_REVISION_HELP),
 ) -> None:
     """Serve POST /v1/systemone. JevBench's typesafe adapter runs against it unchanged."""
     from .server import serve
@@ -106,6 +129,8 @@ def serve_cmd(
         max_batch=max_batch,
         vision=vision,
         max_batch_tokens=max_batch_tokens,
+        attention=attention,
+        revision=revision,
     )
 
 
@@ -130,6 +155,13 @@ def ask_cmd(
         "Auto-detected when omitted: cuda > mps > cpu; mlx only when asked for.",
     ),
     as_json: bool = typer.Option(False, "--json", help="Print the raw API response."),
+    attention: str = typer.Option(
+        "two-way",
+        "--attention",
+        help=_ATTENTION_HELP,
+        callback=_check_attention,
+    ),
+    revision: str | None = typer.Option(None, "--revision", help=_REVISION_HELP),
 ) -> None:
     """Ask one state a set of typed questions from the command line."""
     from .infer import EngineConfig, load_engine
@@ -158,17 +190,27 @@ def ask_cmd(
     if image:
         import base64
 
+        from .h2o import is_h2o
+        from .modeling import checkpoint_dir
         from .vision import load_vision_engine
 
+        if is_h2o(checkpoint, revision):
+            raise typer.BadParameter(
+                "h2o-lightning checkpoints are served text-only; image input is not supported",
+                param_hint="--image",
+            )
         encoded = []
         for path in image:
             with open(path, "rb") as fh:
                 encoded.append(base64.b64encode(fh.read()).decode("ascii"))
-        response = load_vision_engine(checkpoint, EngineConfig(device=selected_device)).ask_images(
+        source = checkpoint if revision is None else checkpoint_dir(checkpoint, revision)
+        response = load_vision_engine(source, EngineConfig(device=selected_device)).ask_images(
             state, questions, encoded
         )
     else:
-        response = load_engine(checkpoint, device=selected_device).ask(state, questions)
+        response = load_engine(
+            checkpoint, device=selected_device, attention=attention, revision=revision
+        ).ask(state, questions)
 
     if as_json:
         console.print_json(response.model_dump_json())
