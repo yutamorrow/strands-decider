@@ -708,3 +708,22 @@ def test_device_mlx_without_mlx_names_the_extra(ckpt, monkeypatch):
         infer.load_engine(str(ckpt), device="mlx")
     with pytest.raises(RuntimeError, match=r"strands-decider\[mlx\]"):
         server.create_app(str(ckpt), device="mlx")
+
+
+def test_mlx_reads_the_output_rows_torch_reads(monkeypatch):
+    """The MLX backend takes tied vs untied output rows from the checkpoint's text config, as
+    torch does, and refuses an untied checkpoint whose mlx-lm model has no lm_head. (Runs
+    without mlx: only the choice of rows is checked here; tests/test_h2o_mlx.py runs them.)"""
+    from types import SimpleNamespace
+
+    from strands_decider import h2o_mlx
+
+    for tied in (True, False):
+        cfg = transformers.Qwen3_5TextConfig(tie_word_embeddings=tied)
+        assert h2o_mlx.tied_output_embeddings(cfg) is tied
+    decoder = SimpleNamespace(embed_tokens=SimpleNamespace(weight=SimpleNamespace(shape=(32, 16))))
+    assert h2o_mlx.MLXBackend(decoder, SimpleNamespace(), "p").tied
+    untied = h2o_mlx.MLXBackend(decoder, SimpleNamespace(lm_head=object()), "p", tied=False)
+    assert not untied.tied
+    with pytest.raises(ValueError, match=r"untied output embeddings.*no lm_head"):
+        h2o_mlx.MLXBackend(decoder, SimpleNamespace(), "p", tied=False)
