@@ -11,6 +11,18 @@ shared-prefix path and plain batched encoding, and checks they give the same ans
     python evaluation/bench_local.py checkpoints/hobson-2b-v19 --device cpu \
         --lengths 256,1024 --questions 1,8 --reps 3
 
+h2o-lightning checkpoints (docs/h2o-lightning.md) are timed the same way, on one path
+(`single`: each question is one whole prompt), in the reading `--attention` gives; the
+GGUF build through a llama-server with `--engine llama-server`:
+
+    python evaluation/bench_local.py h2oai/h2o-lightning-4b --revision REV --device cuda \
+        --attention one-way --image photo.png
+    python evaluation/bench_local.py h2oai/h2o-lightning-4b --revision REV \
+        --engine llama-server --llama-server-url http://127.0.0.1:8080
+
+`--image` (repeatable) times requests carrying those images; the `images` column gives
+their number (0 without).
+
 Writes one CSV row per (device, length, questions, path) with median / p90 / min over
 `--reps` timed runs, after `--warmup` untimed ones per device.
 """
@@ -18,6 +30,7 @@ Writes one CSV row per (device, length, questions, path) with median / p90 / min
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import platform
 import resource
@@ -28,6 +41,7 @@ from dataclasses import replace
 
 import torch
 
+from strands_decider.h2o import H2OEngine
 from strands_decider.infer import load_engine
 from strands_decider.schema import ChoiceQuestion, SystemOneRequest
 
@@ -111,6 +125,29 @@ def time_request(engine, req, reps: int):
     return times, resp
 
 
+def _dtype_name(engine, device: str) -> str:
+    """The dtype the torso runs in, as the CSV reports it."""
+    if isinstance(engine, H2OEngine):
+        lm = getattr(engine.backend, "lm", None)
+        if lm is not None:
+            return str(next(lm.parameters()).dtype).removeprefix("torch.")
+        return {"mlx": "mlx-checkpoint", "llama-server": "gguf"}.get(engine.cfg.device, "?")
+    dtype = (
+        engine.model.config.torch_dtype
+        if device == "mlx"
+        else next(engine.model.torso.parameters()).dtype
+    )
+    return str(dtype).removeprefix("torch.")
+
+
+def _images(paths: list[str]) -> list[str]:
+    out = []
+    for path in paths:
+        with open(path, "rb") as fh:
+            out.append(base64.b64encode(fh.read()).decode("ascii"))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -127,22 +164,51 @@ def main() -> int:
         "--dtype",
         choices=["checkpoint", "float32", "bfloat16", "float16"],
         default="checkpoint",
-        help="cast the torso after loading (on CPU the engine already uses fp32)",
+        help="cast the torso after loading (on CPU the engine already uses fp32); "
+        "strands-decider checkpoints only",
     )
+    ap.add_argument(
+        "--attention",
+        choices=["two-way", "one-way"],
+        default=None,
+        help="h2o-lightning checkpoints: the reading (default: the build's own)",
+    )
+    ap.add_argument("--revision", default=None, help="Hub revision of the checkpoint")
+    ap.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        help="image file sent with every request; repeatable (loads the vision tower)",
+    )
+    ap.add_argument("--engine", choices=["local", "llama-server"], default="local")
+    ap.add_argument("--llama-server-url", default=None)
     ap.add_argument("--out", default="bench_local.csv")
     args = ap.parse_args()
 
     devices = args.device or ["mps" if torch.backends.mps.is_available() else "cpu"]
+    if args.engine == "llama-server":
+        devices = ["llama-server"]
     lengths = [int(x) for x in args.lengths.split(",")]
     qcounts = [int(x) for x in args.questions.split(",")]
+    images = _images(args.image)
 
     rows = []
     for device in devices:
         t0 = time.perf_counter()
-        engine = load_engine(args.checkpoint, device=device)
-        if args.dtype != "checkpoint" and device == "mlx":
+        engine = load_engine(
+            args.checkpoint,
+            device="cpu" if device == "llama-server" else device,
+            attention=args.attention,
+            revision=args.revision,
+            vision=bool(images),
+            engine=args.engine,
+            llama_server_url=args.llama_server_url,
+        )
+        h2o = isinstance(engine, H2OEngine)
+        if args.dtype != "checkpoint" and (device == "mlx" or h2o):
             raise SystemExit(
-                "--dtype applies to torch devices; the MLX torso runs in the checkpoint's dtype"
+                "--dtype applies to strands-decider checkpoints on torch devices; the MLX torso "
+                "and h2o-lightning checkpoints run in the checkpoint's dtype"
             )
         if args.dtype != "checkpoint":
             # load_engine builds under inference_mode, so the cast must happen there too.
@@ -150,18 +216,17 @@ def main() -> int:
                 engine.model.torso.to(getattr(torch, args.dtype))
         load_s = time.perf_counter() - t0
         tok = engine.tok
-        dtype = (
-            engine.model.config.torch_dtype
-            if device == "mlx"
-            else next(engine.model.torso.parameters()).dtype
-        )
+        dtype = _dtype_name(engine, device)
+        reading = f", {engine.attention}" if h2o else ""
         print(
             f"\n== {device}: loaded in {load_s:.1f}s, torch {torch.__version__}, "
-            f"threads {torch.get_num_threads()}, torso {dtype}",
+            f"threads {torch.get_num_threads()}, torso {dtype}{reading}",
             flush=True,
         )
 
-        warm = SystemOneRequest(state=make_state(tok, 256), questions=make_questions(2))
+        warm = SystemOneRequest(
+            state=make_state(tok, 256), questions=make_questions(2), images=images
+        )
         for _ in range(args.warmup):
             with torch.inference_mode():
                 engine.evaluate(warm)
@@ -170,13 +235,15 @@ def main() -> int:
         for n_tok in lengths:
             state = make_state(tok, n_tok)
             for k in qcounts:
-                req = SystemOneRequest(state=state, questions=make_questions(k))
+                req = SystemOneRequest(state=state, questions=make_questions(k), images=images)
                 # One question always takes the batched path (infer.py skips the prefix
-                # cache for it), so there is only one path to time.
-                paths = ["prefix", "batched"] if k > 1 else ["single"]
+                # cache for it), so there is only one path to time. An h2o-lightning engine
+                # reads every question as one whole prompt: one path as well.
+                paths = ["prefix", "batched"] if k > 1 and not h2o else ["single"]
                 answers = {}
                 for path in paths:
-                    engine.cfg = replace(base_cfg, use_prefix_cache=(path == "prefix"))
+                    if not h2o:
+                        engine.cfg = replace(base_cfg, use_prefix_cache=(path == "prefix"))
                     reset_peak_mem(device)
                     times, resp = time_request(engine, req, args.reps)
                     if path == "prefix" and not engine.cfg.use_prefix_cache:
@@ -190,7 +257,7 @@ def main() -> int:
                     answers[path] = {n: a.choice for n, a in resp.answers.items()}
                     row = {
                         "device": device,
-                        "dtype": str(dtype).removeprefix("torch."),
+                        "dtype": dtype,
                         "state_tokens": n_tok,
                         "questions": k,
                         "path": path,
@@ -200,6 +267,7 @@ def main() -> int:
                         "min_ms": round(min(times), 1),
                         "reps": args.reps,
                         "peak_mem_gib": round(peak_mem_gib(device), 2),
+                        "images": len(images),
                     }
                     rows.append(row)
                     print(
@@ -231,6 +299,7 @@ def main() -> int:
         "reps",
         "peak_mem_gib",
         "same_answer",
+        "images",
     ]
     with open(args.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)

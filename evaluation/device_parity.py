@@ -9,6 +9,8 @@ many chosen answers changed.
     python evaluation/device_parity.py checkpoints/hobson-2b-v19 --device mps --device mlx
     python evaluation/device_parity.py StrandsAgents/strands-decider-2B-hobson-v19 \
         --device cpu --device mlx --out parity.json
+    python evaluation/device_parity.py h2oai/h2o-lightning-4b --revision REV \
+        --device cpu --device mlx --attention one-way
 
 Devices load one after another, and each engine is released before the next loads.
 """
@@ -93,8 +95,10 @@ def chosen(answer: dict) -> str:
     return max(p, key=p.__getitem__)
 
 
-def answers(checkpoint: str, device: str) -> dict[str, dict]:
-    engine = load_engine(checkpoint, device=device)
+def answers(
+    checkpoint: str, device: str, attention: str | None = None, revision: str | None = None
+) -> dict[str, dict]:
+    engine = load_engine(checkpoint, device=device, attention=attention, revision=revision)
     try:
         return {name: engine.evaluate(req).model_dump() for name, req in requests().items()}
     finally:
@@ -129,10 +133,20 @@ def main() -> None:
     ap.add_argument(
         "--out", default=None, help="write every device's answers and the comparison here"
     )
+    ap.add_argument(
+        "--attention",
+        choices=["two-way", "one-way"],
+        default=None,
+        help="h2o-lightning checkpoints: the reading on every device (default: the build's own)",
+    )
+    ap.add_argument("--revision", default=None, help="Hub revision of the checkpoint")
     args = ap.parse_args()
     if len(args.device) < 2:
         ap.error("give at least two --device values")
-    results = {device: answers(args.checkpoint, device) for device in args.device}
+    results = {
+        device: answers(args.checkpoint, device, args.attention, args.revision)
+        for device in args.device
+    }
     reference = args.device[0]
     report = {device: compare(results[reference], results[device]) for device in args.device[1:]}
     for device, row in report.items():
