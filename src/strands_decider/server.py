@@ -73,17 +73,26 @@ def create_app(
     max_batch_tokens: int | None = None,
     attention: str | None = None,
     revision: str | None = None,
+    engine: str = "local",
+    llama_server_url: str | None = None,
+    llama_server_timeout: float = 60.0,
 ) -> FastAPI:
     """The app for `checkpoint`. An h2o-lightning checkpoint (see h2o.py) is read with
-    `attention` ("two-way" or "one-way"; None: the build's default, two-way for the HF build);
-    `attention` is not used for a strands-decider checkpoint. `revision` is the Hub revision to
-    download (None: the default branch). `vision` keeps the vision tower, on torch devices only."""
+    `attention` ("two-way" or "one-way"; None: the build's default, two-way for the HF build,
+    one-way for the light builds); `attention` is not used for a strands-decider checkpoint.
+    `revision` is the Hub revision to download (None: the default branch). `vision` keeps the
+    vision tower, on torch devices only. `engine="llama-server"` answers through a llama-server
+    running h2o-lightning's GGUF build at `llama_server_url` (see `infer.load_engine`); its
+    failures are HTTP 502."""
     global _engine
-    from .h2o import ATTENTION_MODES, MLX_IMAGES_UNSUPPORTED
-    from .infer import MLX_EXTRA_MESSAGE, mlx_available
+    from .h2o import ATTENTION_MODES, ENGINES, MLX_IMAGES_UNSUPPORTED
+    from .h2o_llama import LlamaServerError
+    from .infer import MLX_EXTRA_MESSAGE, load_engine, mlx_available
 
     if attention is not None and attention not in ATTENTION_MODES:
         raise ValueError(f"attention must be one of {list(ATTENTION_MODES)}, got {attention!r}")
+    if engine not in ENGINES:
+        raise ValueError(f"engine must be one of {list(ENGINES)}, got {engine!r}")
     app = FastAPI(
         title="strands-decider System One",
         version="0.1.0",
@@ -102,12 +111,24 @@ def create_app(
         max_batch=max_batch,
         max_batch_tokens=max_batch_tokens,
     )
-    if vision and device == "mlx":
+    if engine == "llama-server":
+        llama = load_engine(
+            checkpoint,
+            attention=attention,
+            revision=revision,
+            engine=engine,
+            llama_server_url=llama_server_url,
+            llama_server_timeout=llama_server_timeout,
+        )
+        assert isinstance(llama, H2OEngine)
+        llama.cfg.model_name = resolved_name
+        _engine = llama
+    elif vision and device == "mlx":
         # Checked before anything loads, so it is this error with or without the mlx extra.
         raise ValueError(
             f"--vision runs on torch devices (cuda, mps, cpu), not mlx: {MLX_IMAGES_UNSUPPORTED}"
         )
-    if (h2o_path := resolve(checkpoint, revision, refuse_quantised=device != "mlx")) is not None:
+    elif (h2o_path := resolve(checkpoint, revision, refuse_quantised=device != "mlx")) is not None:
         if device == "mlx" and not mlx_available():
             raise RuntimeError(MLX_EXTRA_MESSAGE)
         _engine = _load_h2o(
@@ -174,6 +195,9 @@ def create_app(
         except ValueError as exc:
             # Option count over num_slots, malformed permutation, etc. -- caller error.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except LlamaServerError as exc:
+            # The llama-server behind this one failed: not the caller's error.
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         elapsed_ms = (time.perf_counter() - started) * 1000
         payload = response.model_dump()
         payload["latency_ms"] = round(elapsed_ms, 2)
@@ -196,6 +220,9 @@ def serve(
     max_batch_tokens: int | None = None,
     attention: str | None = None,
     revision: str | None = None,
+    engine: str = "local",
+    llama_server_url: str | None = None,
+    llama_server_timeout: float = 60.0,
 ) -> None:
     import uvicorn
 
@@ -210,6 +237,9 @@ def serve(
         max_batch_tokens=max_batch_tokens,
         attention=attention,
         revision=revision,
+        engine=engine,
+        llama_server_url=llama_server_url,
+        llama_server_timeout=llama_server_timeout,
     )
     # Single worker: the model owns the GPU, and forking more would just duplicate it.
     uvicorn.run(app, host=host, port=port, workers=1)

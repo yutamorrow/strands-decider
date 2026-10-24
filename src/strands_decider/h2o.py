@@ -28,6 +28,9 @@ Images (`serve --vision`, `ask --image`, `load_engine(..., vision=True)`; torch 
 read by h2o_vision.py: one placeholder per image opens the user turn, and an image request uses
 the `image` block's temperature (`two_way.image_temperature` in two-way when set).
 
+The light builds read one-way by default: an MLX-quantised build on `--device mlx` (h2o_mlx.py)
+and the GGUF build through a llama-server (`--engine llama-server`, h2o_llama.py).
+
 The existing strands-decider checkpoint path (`StrandsDeciderModel`, `SystemOneEngine`) is
 untouched; `infer.load_engine` and `server.create_app` branch here only when `resolve` finds an
 h2o-lightning checkpoint.
@@ -87,6 +90,8 @@ H2O_FILES = (
 H2O_CONFIG_FILES = tuple(f for f in H2O_FILES if f not in ("model.safetensors", LABEL_ROWS))
 ATTENTION_MODES = ("two-way", "one-way")
 DEFAULT_ATTENTION = "two-way"
+# Where the weights run: in this process (torch or MLX), or in a llama-server (h2o_llama.py).
+ENGINES = ("local", "llama-server")
 # The default reading of the light builds (MLX-quantised, GGUF through llama-server), which
 # read one-way only unless the checkpoint ships label rows.
 LIGHT_DEFAULT_ATTENTION = "one-way"
@@ -901,7 +906,8 @@ class H2OEngine:
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
         images = self._prepare_images(request.images) if request.images else None
         n_images = len(request.images) if request.images else 0
-        placeholder = getattr(self.backend, "image_placeholder", IMAGE_PLACEHOLDER)
+        # Where each image goes in the prompt: Qwen's placeholder, or the backend's own marker.
+        placeholder = getattr(images, "placeholder", None) or IMAGE_PLACEHOLDER
         rendered = {
             name: render_prompt(
                 self.tok,

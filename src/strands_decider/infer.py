@@ -570,19 +570,49 @@ def load_engine(
     attention: str | None = None,
     revision: str | None = None,
     vision: bool = False,
+    engine: str = "local",
+    llama_server_url: str | None = None,
+    llama_server_timeout: float = 60.0,
 ) -> SystemOneEngine | H2OEngine:
     """An engine on a torch device ("cuda", "mps", "cpu"), or on MLX with `device="mlx"`.
 
     An h2o-lightning checkpoint (`serve_config.json` and no decider config, see h2o.py) gives an
     `H2OEngine` read with `attention` ("two-way" or "one-way"; None: the build's default, two-way
-    for the HF build); `attention` is not used for a strands-decider checkpoint. `revision` is the
-    Hub revision to download (None: the default branch). `vision` loads the vision tower too, so
-    requests may carry `images` (torch devices only).
+    for the HF build, one-way for the light builds); `attention` is not used for a strands-decider
+    checkpoint. `revision` is the Hub revision to download (None: the default branch). `vision`
+    loads the vision tower too, so requests may carry `images` (torch devices only).
+
+    `engine="llama-server"` answers through a llama-server running h2o-lightning's GGUF build
+    (h2o_llama.py): `checkpoint` is then the h2o-lightning repo or folder the prompt settings and
+    tokenizer are read from (its weights are not downloaded), `llama_server_url` the server's
+    address (None: $STRANDS_DECIDER_LLAMA_SERVER_URL, else http://127.0.0.1:8080) and `device`
+    is not used.
     """
-    from .h2o import ATTENTION_MODES, MLX_IMAGES_UNSUPPORTED, load_h2o_engine, resolve
+    from .h2o import (
+        ATTENTION_MODES,
+        ENGINES,
+        H2O_CONFIG_FILES,
+        MLX_IMAGES_UNSUPPORTED,
+        load_h2o_engine,
+        resolve,
+    )
 
     if attention is not None and attention not in ATTENTION_MODES:
         raise ValueError(f"attention must be one of {list(ATTENTION_MODES)}, got {attention!r}")
+    if engine not in ENGINES:
+        raise ValueError(f"engine must be one of {list(ENGINES)}, got {engine!r}")
+    if engine == "llama-server":
+        from .h2o_llama import load as load_llama
+
+        settings = resolve(checkpoint, revision, files=H2O_CONFIG_FILES)
+        if settings is None:
+            raise ValueError(
+                f"{checkpoint}: --engine llama-server needs an h2o-lightning checkpoint, whose "
+                "serve_config.json and tokenizer give the prompt"
+            )
+        return load_llama(
+            settings, url=llama_server_url, timeout=llama_server_timeout, attention=attention
+        )
     if vision and device == "mlx":
         raise ValueError(MLX_IMAGES_UNSUPPORTED)
     if device == "mlx" and not mlx_available():

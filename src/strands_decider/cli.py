@@ -59,6 +59,24 @@ _ATTENTION_HELP = (
 _REVISION_HELP = (
     "Hub revision (branch, tag or commit) to download. Default: the repo's default branch."
 )
+_ENGINE_HELP = (
+    "local (default): run the weights here, on --device. llama-server: answer through a "
+    "llama-server running h2o-lightning's GGUF build (docs/h2o-lightning.md); CHECKPOINT then "
+    "gives only the prompt settings and tokenizer."
+)
+_LLAMA_URL_HELP = (
+    "The llama-server's address, fixed at start-up. Default: $STRANDS_DECIDER_LLAMA_SERVER_URL, "
+    "else http://127.0.0.1:8080. A host that is not this machine gets a warning."
+)
+_LLAMA_TIMEOUT_HELP = "Seconds to wait for the llama-server's answer."
+
+
+def _check_engine(value: str) -> str:
+    from .h2o import ENGINES
+
+    if value not in ENGINES:
+        raise typer.BadParameter(f"must be one of {', '.join(ENGINES)}")
+    return value
 
 
 def _check_attention(value: str | None) -> str | None:
@@ -113,6 +131,11 @@ def serve_cmd(
         callback=_check_attention,
     ),
     revision: str | None = typer.Option(None, "--revision", help=_REVISION_HELP),
+    engine: str = typer.Option("local", "--engine", help=_ENGINE_HELP, callback=_check_engine),
+    llama_server_url: str | None = typer.Option(None, "--llama-server-url", help=_LLAMA_URL_HELP),
+    llama_server_timeout: float = typer.Option(
+        60.0, "--llama-server-timeout", help=_LLAMA_TIMEOUT_HELP
+    ),
 ) -> None:
     """Serve POST /v1/systemone. JevBench's typesafe adapter runs against it unchanged."""
     from .server import serve
@@ -132,6 +155,9 @@ def serve_cmd(
         max_batch_tokens=max_batch_tokens,
         attention=attention,
         revision=revision,
+        engine=engine,
+        llama_server_url=llama_server_url,
+        llama_server_timeout=llama_server_timeout,
     )
 
 
@@ -163,6 +189,11 @@ def ask_cmd(
         callback=_check_attention,
     ),
     revision: str | None = typer.Option(None, "--revision", help=_REVISION_HELP),
+    engine: str = typer.Option("local", "--engine", help=_ENGINE_HELP, callback=_check_engine),
+    llama_server_url: str | None = typer.Option(None, "--llama-server-url", help=_LLAMA_URL_HELP),
+    llama_server_timeout: float = typer.Option(
+        60.0, "--llama-server-timeout", help=_LLAMA_TIMEOUT_HELP
+    ),
 ) -> None:
     """Ask one state a set of typed questions from the command line."""
     from .infer import load_engine
@@ -189,32 +220,37 @@ def ask_cmd(
         raise typer.BadParameter("ask at least one --noul / --choice / --score question")
 
     selected_device = resolve_device(device)
+    from .h2o_llama import LlamaServerError
+
+    request = SystemOneRequest(state=state, questions=questions)
     if image:
         import base64
 
         from .h2o import MLX_IMAGES_UNSUPPORTED
 
-        if selected_device == "mlx":
+        if selected_device == "mlx" and engine == "local":
             # Before anything loads, so it is this error with or without the mlx extra.
             raise typer.BadParameter(MLX_IMAGES_UNSUPPORTED, param_hint="--image")
         encoded = []
         for path in image:
             with open(path, "rb") as fh:
                 encoded.append(base64.b64encode(fh.read()).decode("ascii"))
-        engine = load_engine(
-            checkpoint,
-            device=selected_device,
-            attention=attention,
-            revision=revision,
-            vision=True,
-        )
-        response = engine.evaluate(
-            SystemOneRequest(state=state, questions=questions, images=encoded)
-        )
-    else:
-        response = load_engine(
-            checkpoint, device=selected_device, attention=attention, revision=revision
-        ).ask(state, questions)
+        request = SystemOneRequest(state=state, questions=questions, images=encoded)
+    loaded = load_engine(
+        checkpoint,
+        device=selected_device,
+        attention=attention,
+        revision=revision,
+        vision=bool(image),
+        engine=engine,
+        llama_server_url=llama_server_url,
+        llama_server_timeout=llama_server_timeout,
+    )
+    try:
+        response = loaded.evaluate(request)
+    except LlamaServerError as e:
+        console.print(f"[red]error:[/] {e}")
+        raise typer.Exit(1) from e
 
     if as_json:
         console.print_json(response.model_dump_json())
