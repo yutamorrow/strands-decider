@@ -234,6 +234,7 @@ def test_an_h2o_hub_repo_downloads_only_the_listed_files(ckpt, monkeypatch):
         "special_tokens_map.json",
         "vocab.json",
         "merges.txt",
+        "preprocessor_config.json",
         "serve_config.json",
         "label_rows.lightning",
     }
@@ -316,6 +317,103 @@ def test_hub_failures_on_an_h2o_repo_name_the_repo_and_the_cause(ckpt, monkeypat
 
     monkeypatch.setattr(h2o, "hf_hub_download", no_serve_config)
     assert h2o.resolve("org/strands-decider-2B") is None
+
+
+def _quantised_copy(ckpt, path):
+    """A copy of `ckpt` whose config.json sets mlx-lm's `quantization` (an MLX-quantised build)."""
+    import shutil
+
+    shutil.copytree(ckpt, path)
+    cfg = json.loads((path / "config.json").read_text())
+    cfg["quantization"] = {"group_size": 64, "bits": 8}
+    (path / "config.json").write_text(json.dumps(cfg))
+    return path
+
+
+def test_an_mlx_quantised_build_is_read_only_on_mlx(ckpt, tmp_path, monkeypatch):
+    """A config.json with `quantization` marks an MLX-quantised build; a torch device refuses it
+    by name (load_engine, create_app, load_h2o_engine), and a Hub id is refused from its
+    config.json before the weights are downloaded."""
+    quantised = _quantised_copy(ckpt, tmp_path / "q8")
+    assert h2o.is_mlx_quantised(str(quantised)) and not h2o.is_mlx_quantised(str(ckpt))
+    for load in (
+        lambda: infer.load_engine(str(quantised), device="cpu"),
+        lambda: server.create_app(str(quantised), device="cpu"),
+        lambda: h2o.load_h2o_engine(str(quantised), device="cpu"),
+    ):
+        with pytest.raises(ValueError, match=r"MLX-quantised.*only with --device mlx"):
+            load()
+    hub = _Hub(quantised, {"serve_config.json", "config.json"})
+    monkeypatch.setattr(h2o, "hf_hub_download", hub.hf_hub_download)
+    monkeypatch.setattr(h2o, "snapshot_download", hub.snapshot_download)
+    with pytest.raises(ValueError, match="only with --device mlx"):
+        infer.load_engine("netprojects/h2o-lightning-4b-mlx-q8", device="cpu")
+    assert hub.snapshots == []  # refused before anything large is downloaded
+
+
+def test_without_attention_the_hf_build_reads_two_way(ckpt, monkeypatch):
+    """With no attention given, the HF build reads two-way from load_engine, create_app and ask."""
+    loaded = []
+    original = h2o.load_h2o_engine
+
+    def spy(*args, **kwargs):
+        engine = original(*args, **kwargs)
+        loaded.append(engine.attention)
+        return engine
+
+    monkeypatch.setattr(h2o, "load_h2o_engine", spy)
+    assert infer.load_engine(str(ckpt), device="cpu").attention == "two-way"
+    server.create_app(str(ckpt), device="cpu")
+    assert server.get_engine().attention == "two-way"
+    assert _ask([str(ckpt), *ASK], monkeypatch).exit_code == 0
+    assert loaded == ["two-way"] * 2  # load_engine and ask (create_app is checked above)
+
+
+def test_without_label_rows_a_label_is_the_token_after_the_prefill(ckpt, tmp_path):
+    """A checkpoint without label_rows.lightning reads each label from the single token after
+    `Answer:`, as h2o builds its label rows: ` A` when that is one token, else `A`; a label that
+    is neither is refused. The HF build of such a checkpoint (h2o's releases before v1.3) reads
+    one-way with those token ids; two-way needs the file."""
+    from tokenizers import pre_tokenizers
+
+    alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+    vocab = {"<|endoftext|>": 0, **{c: i + 1 for i, c in enumerate(alphabet)}}
+    vocab["ĠA"] = len(vocab)
+    tok = transformers.Qwen3_5Tokenizer(vocab=vocab, merges=[("Ġ", "A")])
+    config = h2o.H2OServeConfig.from_dict({**SERVE_CONFIG, "labels": ["A", "B"]})
+    assert h2o.label_groups_from_tokenizer(tok, config) == [
+        ("A", [vocab["ĠA"]]),
+        ("B", [vocab["B"]]),
+    ]
+    two = h2o.H2OServeConfig.from_dict({**SERVE_CONFIG, "labels": ["A", "BC"]})
+    with pytest.raises(ValueError, match="'BC' is not a single token"):
+        h2o.label_groups_from_tokenizer(tok, two)
+
+    import shutil
+
+    bare = tmp_path / "no-label-rows"
+    shutil.copytree(ckpt, bare)
+    (bare / h2o.LABEL_ROWS).unlink()
+    without = h2o.load_h2o_engine(str(bare), device="cpu", attention="one-way")
+    assert without.label_rows is None
+    groups = h2o.label_groups_from_tokenizer(without.tok, without.serve_config)
+    assert all(without.group(label) == ids for label, ids in groups)
+    response = without.evaluate(SystemOneRequest(state=STATE, questions=QUESTIONS))
+    SystemOneResponse.model_validate(response.model_dump())
+    assert list(response.answers) == list(QUESTIONS)
+    with pytest.raises(FileNotFoundError, match=r"label_rows\.lightning"):
+        h2o.load_h2o_engine(str(bare), device="cpu")
+
+
+def test_a_stopped_format_is_refused_with_its_reason(monkeypatch):
+    """A format listed in STOPPED_FORMATS is refused with the reason recorded there; formats not
+    listed load as usual (the list ships empty)."""
+    assert h2o.STOPPED_FORMATS == {}
+    h2o.check_not_stopped("llama-server")
+    monkeypatch.setitem(h2o.STOPPED_FORMATS, "llama-server", "no label probabilities (tried X)")
+    with pytest.raises(ValueError, match=r"llama-server is not supported.*tried X"):
+        h2o.check_not_stopped("llama-server")
+    h2o.check_not_stopped("mlx-quantised")
 
 
 def test_loading_never_trusts_remote_code(ckpt, monkeypatch):
@@ -683,22 +781,35 @@ def test_more_options_than_labels_is_a_caller_error(client, ckpt, monkeypatch, t
     assert result.exit_code != 0
 
 
-def test_images_are_refused(client, ckpt, monkeypatch, tmp_path, two_way):
-    """Images (request images, serve --vision, ask --image) are refused as unsupported."""
-    with pytest.raises(ValueError, match="image input is not supported"):
-        two_way.evaluate(
-            SystemOneRequest(
-                state=STATE, questions={"team": QUESTIONS["team"]}, images=["aGVsbG8="]
-            )
-        )
+def test_images_are_refused_on_mlx_and_without_the_vision_tower(client, two_way, monkeypatch):
+    """Rewritten for image input (it pinned the text-only refusal this change replaces): images
+    on an MLX backend are refused naming the torch devices, and a text engine (loaded without
+    --vision) refuses them naming --vision, a 422 from serve."""
+    request = SystemOneRequest(
+        state=STATE, questions={"team": QUESTIONS["team"]}, images=["aGVsbG8="]
+    )
+
+    class MLXLike:
+        device = "mlx"
+        hidden_size = 64
+        supports_images = False
+        supports_two_way = True
+
+    engine = h2o.H2OEngine(
+        serve_config=two_way.serve_config,
+        label_rows=two_way.label_rows,
+        tokenizer=two_way.tok,
+        backend=MLXLike(),
+        attention="two-way",
+        config=h2o.H2OEngineConfig(device="mlx"),
+        max_length=512,
+    )
+    with pytest.raises(ValueError, match=r"not supported on --device mlx.*torch device"):
+        engine.evaluate(request)
+    with pytest.raises(ValueError, match="serve with --vision"):
+        two_way.evaluate(request)
     r = client.post("/v1/systemone", json={**BODY, "images": ["aGVsbG8="]})
-    assert r.status_code == 422 and "image input is not supported" in r.json()["detail"]
-    with pytest.raises(ValueError, match="image input is not supported"):
-        server.create_app(str(ckpt), device="cpu", vision=True)
-    image = tmp_path / "x.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n")
-    result = _ask([str(ckpt), *ASK, "--image", str(image)], monkeypatch)
-    assert result.exit_code != 0 and "image input is not supported" in result.output
+    assert r.status_code == 422 and "--vision" in r.json()["detail"]
 
 
 def test_device_mlx_without_mlx_names_the_extra(ckpt, monkeypatch):

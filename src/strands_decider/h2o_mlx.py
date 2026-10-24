@@ -46,6 +46,8 @@ class MLXBackend:
     """mlx-lm's Qwen3.5 text model, read layer by layer."""
 
     device = "mlx"
+    supports_images = False
+    supports_two_way = True
 
     def __init__(self, decoder: Any, owner: Any, path: str, *, tied: bool = True) -> None:
         self.decoder = decoder
@@ -103,9 +105,10 @@ class MLXBackend:
 
 
 def load(
-    path: str, attention: str = DEFAULT_ATTENTION, config: H2OEngineConfig | None = None
+    path: str, attention: str | None = DEFAULT_ATTENTION, config: H2OEngineConfig | None = None
 ) -> H2OEngine:
-    """An `H2OEngine` with the torso on MLX for the local h2o-lightning checkpoint `path`.
+    """An `H2OEngine` with the torso on MLX for the local h2o-lightning checkpoint `path`
+    (`attention` None reads two-way).
 
     A failure to load or run on MLX (out of memory, weight names mlx-lm does not accept, a layer
     layout other than the one assumed) is a RuntimeError naming the cause and the torch devices;
@@ -115,6 +118,7 @@ def load(
 
     if not mlx_available():
         raise RuntimeError(MLX_EXTRA_MESSAGE)
+    attention = attention or DEFAULT_ATTENTION
     if attention not in ATTENTION_MODES:
         raise ValueError(f"attention must be one of {list(ATTENTION_MODES)}, got {attention!r}")
     serve_config, label_rows, tokenizer, text_cfg, max_length = read_checkpoint(path)

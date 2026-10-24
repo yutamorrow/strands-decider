@@ -52,18 +52,19 @@ def resolve_device(device: str | None) -> str:
 # ---------------------------------------------------------------- serve / ask
 
 _ATTENTION_HELP = (
-    "h2o-lightning checkpoints only (docs/h2o-lightning.md): two-way (the default) or one-way "
-    "attention. Not used for strands-decider checkpoints."
+    "h2o-lightning checkpoints only (docs/h2o-lightning.md): two-way or one-way attention. "
+    "Default: two-way for the HF build, one-way for the light builds. Not used for "
+    "strands-decider checkpoints."
 )
 _REVISION_HELP = (
     "Hub revision (branch, tag or commit) to download. Default: the repo's default branch."
 )
 
 
-def _check_attention(value: str) -> str:
+def _check_attention(value: str | None) -> str | None:
     from .h2o import ATTENTION_MODES
 
-    if value not in ATTENTION_MODES:
+    if value is not None and value not in ATTENTION_MODES:
         raise typer.BadParameter(f"must be one of {', '.join(ATTENTION_MODES)}")
     return value
 
@@ -105,8 +106,8 @@ def serve_cmd(
         "--max-batch-tokens",
         help="Also cap one forward's padded tokens (questions x longest state + question); for long-context torsos.",
     ),
-    attention: str = typer.Option(
-        "two-way",
+    attention: str | None = typer.Option(
+        None,
         "--attention",
         help=_ATTENTION_HELP,
         callback=_check_attention,
@@ -155,8 +156,8 @@ def ask_cmd(
         "Auto-detected when omitted: cuda > mps > cpu; mlx only when asked for.",
     ),
     as_json: bool = typer.Option(False, "--json", help="Print the raw API response."),
-    attention: str = typer.Option(
-        "two-way",
+    attention: str | None = typer.Option(
+        None,
         "--attention",
         help=_ATTENTION_HELP,
         callback=_check_attention,
@@ -164,7 +165,8 @@ def ask_cmd(
     revision: str | None = typer.Option(None, "--revision", help=_REVISION_HELP),
 ) -> None:
     """Ask one state a set of typed questions from the command line."""
-    from .infer import EngineConfig, load_engine
+    from .infer import load_engine
+    from .schema import SystemOneRequest
 
     questions: dict[str, Question] = {}
     for i, q in enumerate(noul or []):
@@ -190,22 +192,24 @@ def ask_cmd(
     if image:
         import base64
 
-        from .h2o import is_h2o
-        from .modeling import checkpoint_dir
-        from .vision import load_vision_engine
+        from .h2o import MLX_IMAGES_UNSUPPORTED
 
-        if is_h2o(checkpoint, revision):
-            raise typer.BadParameter(
-                "h2o-lightning checkpoints are served text-only; image input is not supported",
-                param_hint="--image",
-            )
+        if selected_device == "mlx":
+            # Before anything loads, so it is this error with or without the mlx extra.
+            raise typer.BadParameter(MLX_IMAGES_UNSUPPORTED, param_hint="--image")
         encoded = []
         for path in image:
             with open(path, "rb") as fh:
                 encoded.append(base64.b64encode(fh.read()).decode("ascii"))
-        source = checkpoint if revision is None else checkpoint_dir(checkpoint, revision)
-        response = load_vision_engine(source, EngineConfig(device=selected_device)).ask_images(
-            state, questions, encoded
+        engine = load_engine(
+            checkpoint,
+            device=selected_device,
+            attention=attention,
+            revision=revision,
+            vision=True,
+        )
+        response = engine.evaluate(
+            SystemOneRequest(state=state, questions=questions, images=encoded)
         )
     else:
         response = load_engine(

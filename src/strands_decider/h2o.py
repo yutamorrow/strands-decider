@@ -24,6 +24,10 @@ under the configured floor moves to the floor on its own side.
 Every question is rendered as one whole prompt, tokenised once and forwarded once: in two-way the
 state's positions depend on what follows them, so no state cache is shared between questions.
 
+Images (`serve --vision`, `ask --image`, `load_engine(..., vision=True)`; torch devices only) are
+read by h2o_vision.py: one placeholder per image opens the user turn, and an image request uses
+the `image` block's temperature (`two_way.image_temperature` in two-way when set).
+
 The existing strands-decider checkpoint path (`StrandsDeciderModel`, `SystemOneEngine`) is
 untouched; `infer.load_engine` and `server.create_app` branch here only when `resolve` finds an
 h2o-lightning checkpoint.
@@ -74,16 +78,48 @@ H2O_FILES = (
     "special_tokens_map.json",
     "vocab.json",
     "merges.txt",
+    "preprocessor_config.json",
     SERVE_CONFIG,
     LABEL_ROWS,
 )
+# The files the prompt and the readout need when the weights are elsewhere (a llama-server
+# running the GGUF build): everything but the weights and the label rows.
+H2O_CONFIG_FILES = tuple(f for f in H2O_FILES if f not in ("model.safetensors", LABEL_ROWS))
 ATTENTION_MODES = ("two-way", "one-way")
 DEFAULT_ATTENTION = "two-way"
+# The default reading of the light builds (MLX-quantised, GGUF through llama-server), which
+# read one-way only unless the checkpoint ships label rows.
+LIGHT_DEFAULT_ATTENTION = "one-way"
 QUESTION_TYPES = ("choice", "noul", "score")
 _TEXT_MODEL_TYPES = ("qwen3_5", "qwen3_5_text")
 # Lower bound of a label's log-probability, as h2o's readout floors it.
 _LOGPROB_FLOOR = math.log(1e-12)
-_IMAGES_UNSUPPORTED = "h2o-lightning checkpoints are served text-only by strands-decider; image input is not supported"
+# Qwen's image placeholder, expanded to one `<|image_pad|>` per image token before tokenising.
+IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+MLX_IMAGES_UNSUPPORTED = (
+    "image input is not supported on --device mlx; use a torch device (cuda, mps or cpu) for images"
+)
+_IMAGES_NOT_LOADED = (
+    "this h2o-lightning engine was loaded without image input; serve with --vision "
+    "(ask --image, or load_engine(..., vision=True)) for images"
+)
+_QUANTISED_TORCH = (
+    "{path}: an MLX-quantised h2o-lightning checkpoint (config.json sets quantization); "
+    "it is read only with --device mlx"
+)
+# Formats whose support was stopped because a premise of it failed (FR3x): name -> the reason,
+# which a load of that format reports. Names: "mlx-quantised", "llama-server",
+# "llama-server-images". Empty: every format is supported.
+STOPPED_FORMATS: dict[str, str] = {}
+
+
+def check_not_stopped(name: str) -> None:
+    """Refuse a format listed in `STOPPED_FORMATS`, giving the reason recorded there."""
+    reason = STOPPED_FORMATS.get(name)
+    if reason is not None:
+        raise ValueError(
+            f"{name} is not supported by strands-decider: {reason} (docs/h2o-lightning.md)"
+        )
 
 
 # ------------------------------------------------------------------------------ detection
@@ -136,19 +172,53 @@ def is_h2o(checkpoint: str, revision: str | None = None) -> bool:
         raise _hub_error(checkpoint, f"checking for {CONFIG_NAME} / {LEGACY_CONFIG_NAME}", e) from e
 
 
-def resolve(checkpoint: str, revision: str | None = None) -> str | None:
+def _config_is_quantised(config_file: str) -> bool:
+    with open(config_file, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    return isinstance(cfg, dict) and any(
+        cfg.get(k) for k in ("quantization", "quantization_config")
+    )
+
+
+def is_mlx_quantised(path: str, revision: str | None = None) -> bool:
+    """True when the h2o-lightning checkpoint `path` (a local directory or a Hub repo id) is an
+    MLX-quantised build: its `config.json` sets `quantization` (or `quantization_config`). For a
+    Hub id only `config.json` is fetched; a missing one answers False."""
+    if os.path.isdir(path):
+        config_file = os.path.join(path, "config.json")
+        return os.path.exists(config_file) and _config_is_quantised(config_file)
+    try:
+        config_file = hf_hub_download(path, "config.json", revision=revision)
+    except EntryNotFoundError:
+        return False
+    except Exception as e:
+        raise _hub_error(path, "fetching config.json", e) from e
+    return _config_is_quantised(config_file)
+
+
+def resolve(
+    checkpoint: str,
+    revision: str | None = None,
+    *,
+    files: Sequence[str] = H2O_FILES,
+    refuse_quantised: bool = False,
+) -> str | None:
     """The local directory of an h2o-lightning checkpoint, or None for any other checkpoint.
 
-    A Hub repo is downloaded with `allow_patterns` limited to `H2O_FILES` at `revision`
-    (None: the repo's default branch, as huggingface_hub resolves it). A failed download is a
-    FileNotFoundError naming the repo and the cause.
+    A Hub repo is downloaded with `allow_patterns` limited to `files` (`H2O_FILES`: every file the
+    checkpoint is read from) at `revision` (None: the repo's default branch, as huggingface_hub
+    resolves it). A failed download is a FileNotFoundError naming the repo and the cause. With
+    `refuse_quantised` (a torch device), an MLX-quantised checkpoint is refused from its
+    `config.json` before the weights are downloaded.
     """
     if not is_h2o(checkpoint, revision):
         return None
+    if refuse_quantised and is_mlx_quantised(checkpoint, revision):
+        raise ValueError(_QUANTISED_TORCH.format(path=checkpoint))
     if os.path.isdir(checkpoint):
         return checkpoint
     try:
-        return str(snapshot_download(checkpoint, revision=revision, allow_patterns=list(H2O_FILES)))
+        return str(snapshot_download(checkpoint, revision=revision, allow_patterns=list(files)))
     except Exception as e:
         raise _hub_error(checkpoint, "downloading its files", e) from e
 
@@ -183,6 +253,11 @@ class H2OServeConfig:
     max_state_tokens: int = 32000
     default_instructions: str = "Answer the question below."
     label_rows: str = LABEL_ROWS
+    # The `image` block: None when serve_config.json has none (the checkpoint takes no images).
+    image_temperature: float | None = None
+    two_way_image_temperature: float | None = None
+    max_images: int = 0
+    max_pixels: int = 0
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any], *, source: str = SERVE_CONFIG) -> H2OServeConfig:
@@ -208,6 +283,11 @@ class H2OServeConfig:
         two_way: dict[str, Any] = two_way_raw if isinstance(two_way_raw, dict) else {}
         tw_t = two_way.get("temperature")
         tw_f = two_way.get("noul_floor")
+        image_raw = cfg.get("image")
+        if image_raw is not None and not isinstance(image_raw, dict):
+            raise ValueError(f"{source}: `image` must be an object")
+        image: dict[str, Any] = image_raw or {}
+        image_t, tw_image_t = image.get("temperature"), two_way.get("image_temperature")
         out = cls(
             model=str(cfg.get("model") or "h2o-lightning"),
             base_model=str(cfg.get("base_model") or cfg.get("model") or ""),
@@ -230,7 +310,19 @@ class H2OServeConfig:
                 prompt.get("default_instructions", "Answer the question below.")
             ),
             label_rows=str(two_way.get("label_rows", LABEL_ROWS)),
+            image_temperature=None if image_t is None else float(image_t),
+            two_way_image_temperature=None if tw_image_t is None else float(tw_image_t),
+            max_images=int(image.get("max_images", 1)) if image_raw is not None else 0,
+            max_pixels=int(image.get("max_pixels", 4096 * 4096)) if image_raw is not None else 0,
         )
+        if image_raw is not None and (out.max_images < 1 or out.max_pixels < 1):
+            raise ValueError(f"{source}: image.max_images and image.max_pixels must be positive")
+        for name, value in (
+            ("image.temperature", out.image_temperature),
+            ("two_way.image_temperature", out.two_way_image_temperature),
+        ):
+            if value is not None and not 0.05 <= value <= 20.0:
+                raise ValueError(f"{source}: {name} {value} is outside [0.05, 20]")
         for name, t in (
             ("temperature", out.temperature),
             ("two_way.temperature", out.two_way_temperature),
@@ -255,6 +347,25 @@ class H2OServeConfig:
 
     def floor(self, attention: str) -> float:
         return self.two_way_noul_floor if attention == "two-way" else self.noul_floor
+
+    @property
+    def takes_images(self) -> bool:
+        """Whether serve_config.json has an `image` block (no block: the checkpoint takes none)."""
+        return self.max_images > 0
+
+    def request_temperatures(self, attention: str, with_images: bool) -> dict[str, float]:
+        """The per-type temperatures of one request. With images, every type uses the image
+        temperature: `two_way.image_temperature` in two-way when set, else `image.temperature`;
+        without either, the per-type ones."""
+        if with_images:
+            image_t = (
+                self.two_way_image_temperature
+                if attention == "two-way" and self.two_way_image_temperature is not None
+                else self.image_temperature
+            )
+            if image_t is not None:
+                return {k: image_t for k in QUESTION_TYPES}
+        return self.temperatures(attention)
 
 
 # ------------------------------------------------------------------------- label_rows.lightning
@@ -405,12 +516,19 @@ class RenderedH2O:
 
 
 def render_prompt(
-    tokenizer: Any, config: H2OServeConfig, state: Content, question: Question
+    tokenizer: Any,
+    config: H2OServeConfig,
+    state: Content,
+    question: Question,
+    *,
+    n_images: int = 0,
+    image_placeholder: str = IMAGE_PLACEHOLDER,
 ) -> RenderedH2O:
     """One question's whole prompt, as `serve_config.json` fixes it: the chat template with
     thinking off over [system, user], then the answer prefill. The user turn is
     `record: ...`, `question: ...`, `options:` and one `{label}) {name}: {description}` line per
-    option (or the markdown layout)."""
+    option (or the markdown layout). With `n_images`, one `image_placeholder` per image opens the
+    user turn, before the record (as h2o's own serving places images)."""
     names, descs = question_options(question)
     if len(names) > len(config.labels):
         raise ValueError(
@@ -426,7 +544,7 @@ def render_prompt(
     else:
         head = "### RECORD\n"
         user = f"{head}{state_text}\n\n### QUESTION\n{instructions}\n\n### OPTIONS\n{body}\n"
-    user_text = user.strip()
+    user_text = image_placeholder * n_images + user.strip()
     system = config.system.strip() if config.system is not None else None
     if config.chat_template:
         if not getattr(tokenizer, "chat_template", None):
@@ -451,7 +569,7 @@ def render_prompt(
     start = text.find(user_text, after)
     if start < 0:
         raise ValueError("the chat template does not contain the user turn verbatim")
-    start += len(head)
+    start += len(image_placeholder) * n_images + len(head)
     return RenderedH2O(
         text=text,
         kind=question.type,
@@ -556,11 +674,26 @@ def run_layer(torso: Any, index: int, hidden: torch.Tensor, *, bidirectional: bo
     return out
 
 
-def forward_layers(torso: Any, input_ids: torch.Tensor, *, bidirectional: bool) -> torch.Tensor:
+def forward_layers(
+    torso: Any,
+    input_ids: torch.Tensor | None = None,
+    *,
+    bidirectional: bool,
+    inputs_embeds: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
     """The text model's forward, layer by layer: embed, every decoder layer, final norm. Only the
-    full-attention layers' mask differs between the two readings."""
-    hidden = torso.embed_tokens(input_ids)
-    position_embeddings, positions = _rotary(torso, hidden)
+    full-attention layers' mask differs between the two readings.
+
+    `inputs_embeds` replaces the embedding of `input_ids` (an image prompt, whose image tokens
+    carry the vision tower's features). `position_ids` [4, 1, L] are the text row and the three
+    M-RoPE rows of an image prompt (`get_rope_index`); without them, positions are 0..L-1."""
+    hidden = torso.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+    if position_ids is None:
+        position_embeddings, positions = _rotary(torso, hidden)
+    else:
+        positions = position_ids[0]
+        position_embeddings = torso.rotary_emb(hidden, position_ids[1:])
     mask = _full_attention_mask(hidden.shape[1], bidirectional, hidden.dtype, hidden.device)
     for i, layer in enumerate(torso.layers):
         full = torso.config.layer_types[i] == "full_attention"
@@ -576,10 +709,13 @@ def forward_layers(torso: Any, input_ids: torch.Tensor, *, bidirectional: bool) 
 
 class Backend(Protocol):
     """What `H2OEngine` needs from a torso: the final hidden state at the last position, and
-    the output embedding rows for some token ids."""
+    the output embedding rows for some token ids. `supports_images`: whether `prepare_images`
+    and `last_hidden(..., images=)` work; `supports_two_way`: whether two-way can be read."""
 
     device: str
     hidden_size: int
+    supports_images: bool
+    supports_two_way: bool
 
     def last_hidden(self, ids: list[int], *, bidirectional: bool) -> torch.Tensor: ...
 
@@ -588,6 +724,9 @@ class Backend(Protocol):
 
 class TorchBackend:
     """A Qwen3.5 causal LM on a torch device."""
+
+    supports_images = False
+    supports_two_way = True
 
     def __init__(self, lm: Any, device: str) -> None:
         self.lm = lm
@@ -627,28 +766,53 @@ class H2OEngine:
     """Answers System One requests from an h2o-lightning checkpoint.
 
     The same surface as `SystemOneEngine`: `evaluate(request)` and `ask(state, questions)`
-    return a `SystemOneResponse`. Build one with `load_h2o_engine` (torch) or
-    `h2o_mlx.load` (MLX).
+    return a `SystemOneResponse`. Build one with `load_h2o_engine` (torch), `h2o_mlx.load`
+    (MLX) or `h2o_llama.load` (a llama-server running the GGUF build).
+
+    A checkpoint without `label_rows.lightning` (the light builds) is read one-way only; its
+    labels' token ids then come from the tokenizer (`label_groups_from_tokenizer`).
     """
 
     def __init__(
         self,
         *,
         serve_config: H2OServeConfig,
-        label_rows: LabelRows,
+        label_rows: LabelRows | None,
         tokenizer: Any,
         backend: Backend,
         attention: str,
         config: H2OEngineConfig,
         max_length: int,
+        label_groups: Sequence[tuple[str, list[int]]] | None = None,
     ) -> None:
         if attention not in ATTENTION_MODES:
             raise ValueError(f"attention must be one of {list(ATTENTION_MODES)}, got {attention!r}")
-        label_rows.check_labels(serve_config.labels)
-        if label_rows.hidden != backend.hidden_size:
-            raise ValueError(
-                f"label rows: hidden size {label_rows.hidden}, the model's is {backend.hidden_size}"
+        if attention == "two-way":
+            if not backend.supports_two_way:
+                raise ValueError(
+                    f"{type(backend).__name__} reads one-way only; two-way attention is not "
+                    "supported here (use --attention one-way)"
+                )
+            if label_rows is None:
+                raise ValueError(
+                    f"this checkpoint has no {LABEL_ROWS}, so it cannot be read two-way "
+                    "(use --attention one-way)"
+                )
+        if label_rows is not None:
+            label_rows.check_labels(serve_config.labels)
+            if label_rows.hidden != backend.hidden_size:
+                raise ValueError(
+                    f"label rows: hidden size {label_rows.hidden}, the model's is "
+                    f"{backend.hidden_size}"
+                )
+            groups = label_rows.groups
+        else:
+            groups = list(
+                label_groups
+                if label_groups is not None
+                else label_groups_from_tokenizer(tokenizer, serve_config)
             )
+        self._groups = {label: list(ids) for label, ids in groups}
         self.serve_config = serve_config
         self.label_rows = label_rows
         self.tok = tokenizer
@@ -669,6 +833,13 @@ class H2OEngine:
             "temperature": dict(self.serve_config.temperatures(self.attention)),
         }
 
+    def group(self, label: str) -> list[int]:
+        """The token ids `label` is read from."""
+        try:
+            return self._groups[label]
+        except KeyError:
+            raise ValueError(f"no token ids for label {label!r}") from None
+
     def tokenize(self, rendered: RenderedH2O) -> list[int]:
         """The whole prompt tokenised once; refuses (never truncates) a state over
         `max_state_tokens` or a prompt over the model's window."""
@@ -688,36 +859,78 @@ class H2OEngine:
             )
         return ids
 
-    def label_logits(self, ids: list[int], token_ids: list[int]) -> dict[int, float]:
-        """{token id: logit} at the answer slot for the reading served."""
+    def label_logits(
+        self, ids: list[int], token_ids: list[int], *, images: Any = None
+    ) -> dict[int, float]:
+        """{token id: logit} at the answer slot for the reading served. `images` is the
+        backend's `prepare_images` result for an image request."""
         two_way = self.attention == "two-way"
-        hidden = self.backend.last_hidden(ids, bidirectional=two_way)
-        rows = (
-            self.label_rows.rows_for(token_ids) if two_way else self.backend.output_rows(token_ids)
-        )
+        extra = {} if images is None else {"images": images}
+        hidden = self.backend.last_hidden(ids, bidirectional=two_way, **extra)
+        if two_way:
+            assert self.label_rows is not None  # checked in __init__
+            rows = self.label_rows.rows_for(token_ids)
+        else:
+            rows = self.backend.output_rows(token_ids)
         logits = (rows.to(torch.float64) @ hidden.to(torch.float64)).tolist()
         # The label-row file's softcap belongs to the two-way readout (h2o's pooled_readout);
         # h2o's one-way path reads the causal LM's own logprobs, which carry no such cap.
-        cap = self.label_rows.softcap if two_way else 0.0
+        cap = self.label_rows.softcap if two_way and self.label_rows is not None else 0.0
         if cap:
             logits = [cap * math.tanh(x / cap) for x in logits]
         return dict(zip(token_ids, logits, strict=True))
 
+    def _prepare_images(self, images: Sequence[str]) -> Any:
+        """Check, decode and shrink a request's images, then hand them to the backend."""
+        if not self.backend.supports_images:
+            raise ValueError(
+                MLX_IMAGES_UNSUPPORTED if self.backend.device == "mlx" else _IMAGES_NOT_LOADED
+            )
+        sc = self.serve_config
+        if not sc.takes_images:
+            raise ValueError(
+                f"this checkpoint's {SERVE_CONFIG} has no `image` block; it takes no images"
+            )
+        if len(images) > sc.max_images:
+            raise ValueError(f"{len(images)} images; this checkpoint takes at most {sc.max_images}")
+        from .h2o_vision import decode_images
+
+        prepare: Any = getattr(self.backend, "prepare_images")  # noqa: B009 - Protocol-optional
+        return prepare(decode_images(images, sc.max_pixels))
+
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
-        if request.images:
-            raise ValueError(_IMAGES_UNSUPPORTED)
+        images = self._prepare_images(request.images) if request.images else None
+        n_images = len(request.images) if request.images else 0
+        placeholder = getattr(self.backend, "image_placeholder", IMAGE_PLACEHOLDER)
         rendered = {
-            name: render_prompt(self.tok, self.serve_config, request.state, q)
+            name: render_prompt(
+                self.tok,
+                self.serve_config,
+                request.state,
+                q,
+                n_images=n_images,
+                image_placeholder=placeholder,
+            )
             for name, q in request.questions.items()
         }
+        tokens_per_image = getattr(images, "tokens_per_image", None)
+        if tokens_per_image is not None:
+            from .h2o_vision import expand_rendered
+
+            rendered = {n: expand_rendered(r, tokens_per_image) for n, r in rendered.items()}
         prompts = {name: self.tokenize(r) for name, r in rendered.items()}
-        temperatures = self.serve_config.temperatures(self.attention)
+        temperatures = self.serve_config.request_temperatures(self.attention, images is not None)
         floor = self.serve_config.floor(self.attention)
+        # A backend that reads the label logits itself (a llama-server) is given the prompt.
+        reads_logits: Any = getattr(self.backend, "label_logits", None)
         answers: dict[str, Answer] = {}
         for name, r in rendered.items():
-            groups = [(label, self.label_rows.group(label)) for label in r.labels]
+            groups = [(label, self.group(label)) for label in r.labels]
             token_ids = [t for _, g in groups for t in g]
-            logits = self.label_logits(prompts[name], token_ids)
+            if reads_logits is not None:
+                logits = reads_logits(r.text, prompts[name], token_ids, images=images)
+            else:
+                logits = self.label_logits(prompts[name], token_ids, images=images)
             probs = probabilities(group_log_probs(logits, groups), temperatures[r.kind])
             answers[name] = to_answer(r, probs, floor)
         return SystemOneResponse(
@@ -731,19 +944,62 @@ class H2OEngine:
     def ask(self, state: Content, questions: dict[str, Question]) -> SystemOneResponse:
         return self.evaluate(SystemOneRequest(state=state, questions=questions))
 
+    def ask_images(
+        self, state: Content, questions: dict[str, Question], images: Sequence[str]
+    ) -> SystemOneResponse:
+        return self.evaluate(
+            SystemOneRequest(state=state, questions=questions, images=list(images))
+        )
 
-def read_checkpoint(path: str) -> tuple[H2OServeConfig, LabelRows, Any, Any, int]:
-    """(serve config, label rows, tokenizer, text config, prompt window) of a local checkpoint."""
+
+def label_groups_from_tokenizer(
+    tokenizer: Any, serve_config: H2OServeConfig
+) -> list[tuple[str, list[int]]]:
+    """Each label's token id when the checkpoint ships no `label_rows.lightning`: the single
+    token that follows the `Answer:` prefill, as h2o builds its label rows ("labels via
+    tokenizer.json after 'Answer:'"): the label with a leading space (` A`), else the bare label
+    when that is the single token. A label that is neither is refused."""
+    prefill = serve_config.prefill
+    base = list(tokenizer(prefill, add_special_tokens=False)["input_ids"])
+    groups: list[tuple[str, list[int]]] = []
+    owner: dict[int, str] = {}
+    for label in serve_config.labels:
+        token: int | None = None
+        for text in (" " + label, label):
+            enc = list(tokenizer(prefill + text, add_special_tokens=False)["input_ids"])
+            tail = enc[len(base) :] if enc[: len(base)] == base else []
+            if len(tail) == 1:
+                token = int(tail[0])
+                break
+        if token is None:
+            raise ValueError(
+                f"label {label!r} is not a single token after {prefill!r}; this checkpoint "
+                f"needs its {LABEL_ROWS}"
+            )
+        if token in owner:
+            raise ValueError(f"labels {owner[token]!r} and {label!r} share token id {token}")
+        owner[token] = label
+        groups.append((label, [token]))
+    return groups
+
+
+def read_checkpoint(
+    path: str, *, require_label_rows: bool = True
+) -> tuple[H2OServeConfig, LabelRows | None, Any, Any, int]:
+    """(serve config, label rows, tokenizer, text config, prompt window) of a local checkpoint.
+    Without `require_label_rows`, a checkpoint with no label-row file gives None for them."""
     from transformers import AutoConfig, AutoTokenizer
 
     serve_config = H2OServeConfig.from_file(os.path.join(path, SERVE_CONFIG))
     rows_path = os.path.join(path, serve_config.label_rows)
-    if not os.path.exists(rows_path):
+    label_rows: LabelRows | None = None
+    if os.path.exists(rows_path):
+        label_rows = LabelRows.read(rows_path)
+        label_rows.check_labels(serve_config.labels)
+    elif require_label_rows:
         raise FileNotFoundError(
             f"{rows_path}: missing; an h2o-lightning checkpoint ships its label rows"
         )
-    label_rows = LabelRows.read(rows_path)
-    label_rows.check_labels(serve_config.labels)
     base_cfg = AutoConfig.from_pretrained(path)
     if base_cfg.model_type not in _TEXT_MODEL_TYPES:
         raise ValueError(
@@ -761,22 +1017,31 @@ def load_h2o_engine(
     path: str,
     *,
     device: str = "cuda",
-    attention: str = DEFAULT_ATTENTION,
+    attention: str | None = None,
     attn_implementation: str | None = None,
     model_name: str | None = None,
+    vision: bool = False,
 ) -> H2OEngine:
     """An `H2OEngine` on a torch device for the local h2o-lightning checkpoint `path`
-    (`resolve` gives it for a Hub id)."""
+    (`resolve` gives it for a Hub id). `attention` None reads two-way. With `vision`, the
+    vision tower is loaded too, so requests may carry `images` (h2o_vision.py). One-way also reads
+    a checkpoint without `label_rows.lightning` (h2o's releases before v1.3 ship none), with the
+    labels' token ids from the tokenizer; two-way needs the file."""
     import transformers
 
+    attention = attention or DEFAULT_ATTENTION
     if attention not in ATTENTION_MODES:
         raise ValueError(f"attention must be one of {list(ATTENTION_MODES)}, got {attention!r}")
+    if is_mlx_quantised(path):
+        raise ValueError(_QUANTISED_TORCH.format(path=path))
     implementation = attn_implementation or "sdpa"
     if attention == "two-way" and implementation not in ("sdpa", "eager"):
         raise ValueError(
             f"two-way attention needs attn_implementation sdpa or eager, not {implementation!r}"
         )
-    serve_config, label_rows, tokenizer, text_cfg, max_length = read_checkpoint(path)
+    serve_config, label_rows, tokenizer, text_cfg, max_length = read_checkpoint(
+        path, require_label_rows=attention == "two-way"
+    )
     if str(device).startswith("mps"):
         from .mps_kernels import install
 
@@ -787,15 +1052,24 @@ def load_h2o_engine(
         install_cpu()
     # Half precision is slower than fp32 on CPU (see SystemOneEngine._upcast_torso_for_cpu).
     dtype: Any = torch.float32 if str(device) == "cpu" else "auto"
-    lm: Any = transformers.Qwen3_5ForCausalLM.from_pretrained(
-        path, config=text_cfg, dtype=dtype, attn_implementation=implementation
-    )
-    lm.to(device).eval()
+    backend: Backend
+    if vision:
+        from .h2o_vision import load_vision_backend
+
+        backend = load_vision_backend(
+            path, serve_config, device=device, dtype=dtype, attn_implementation=implementation
+        )
+    else:
+        lm: Any = transformers.Qwen3_5ForCausalLM.from_pretrained(
+            path, config=text_cfg, dtype=dtype, attn_implementation=implementation
+        )
+        lm.to(device).eval()
+        backend = TorchBackend(lm, device)
     return H2OEngine(
         serve_config=serve_config,
         label_rows=label_rows,
         tokenizer=tokenizer,
-        backend=TorchBackend(lm, device),
+        backend=backend,
         attention=attention,
         config=H2OEngineConfig(device=device, model_name=model_name or serve_config.model),
         max_length=max_length,
