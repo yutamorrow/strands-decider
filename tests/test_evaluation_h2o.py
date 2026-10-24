@@ -1014,3 +1014,74 @@ def test_run_checks_header_names_the_commit_and_the_pinned_revision(tmp_path):
             in text
         )
     assert "## U" not in results  # no row was run
+
+
+# ---------------------------------------------------------------- the docs' examples
+
+import ast  # noqa: E402
+import inspect  # noqa: E402
+
+from h2o_lightning import docs_examples  # noqa: E402
+
+DOCS = Path(__file__).resolve().parents[1] / "docs" / "h2o-lightning.md"
+
+
+def _calls(tree, name):
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    ]
+
+
+def test_the_docs_examples_compile_and_use_only_real_names():
+    """The four marked examples compile, and every keyword they give load_engine,
+    SystemOneRequest and the question types exists there (no weights are loaded)."""
+    from strands_decider import schema
+    from strands_decider.infer import load_engine
+
+    examples = docs_examples.extract(DOCS.read_text())
+    assert list(examples) == ["text", "image", "light-mlx", "light-llama"]
+    params = set(inspect.signature(load_engine).parameters)
+    models = {
+        name: set(getattr(schema, name).model_fields)
+        for name in ("SystemOneRequest", "ChoiceQuestion", "NoulQuestion", "ScoreQuestion")
+    }
+    for name, code in examples.items():
+        compile(code, name, "exec")
+        tree = ast.parse(code)
+        [call] = _calls(tree, "load_engine")
+        assert {k.arg for k in call.keywords} <= params, name
+        assert _calls(tree, "SystemOneRequest"), name
+        for model, fields in models.items():
+            for c in _calls(tree, model):
+                assert {k.arg for k in c.keywords} <= fields, (name, model)
+    assert (
+        ast.literal_eval(
+            next(
+                k.value
+                for k in _calls(ast.parse(examples["light-llama"]), "load_engine")[0].keywords
+                if k.arg == "engine"
+            )
+        )
+        == "llama-server"
+    )
+    assert docs_examples.main(["--docs", str(DOCS), "--only", "nonexistent"]) == 1
+
+
+def test_the_docs_list_the_requests_h2o_parity_sends_and_link_what_exists():
+    """The 12 JSON requests in the docs are h2o_parity's, in order, and the docs' relative links
+    and in-page anchors resolve."""
+    text = DOCS.read_text()
+    block = text.split("```json\n", 1)[1].split("```", 1)[0]
+    assert [json.loads(line) for line in block.splitlines()] == list(
+        h2o_parity.TEXT_REQUESTS.values()
+    )
+    for target in re.findall(r"\]\((\.\./[^)#]+)\)", text):
+        assert (DOCS.parent / target).exists(), target
+    anchors = {
+        re.sub(r"[^\w\- ]", "", h.lower()).replace(" ", "-")
+        for h in re.findall(r"^#+ (.+)$", text, re.MULTILINE)
+    }
+    for anchor in re.findall(r"\]\(#([\w-]+)\)", text):
+        assert anchor in anchors, anchor
