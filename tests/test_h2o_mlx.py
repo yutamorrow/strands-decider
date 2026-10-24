@@ -83,3 +83,80 @@ def test_an_mlx_load_failure_names_the_torch_devices(ckpt, monkeypatch):
     with pytest.raises(RuntimeError, match=r"--device cpu \(or cuda / mps\)") as e:
         h2o_mlx.load(str(ckpt))
     assert "Received parameters not in model" in str(e.value)
+
+
+# ---------------------------------------------------------------- MLX-quantised builds
+
+
+@pytest.fixture(scope="module")
+def quantised_ckpt(ckpt, tmp_path_factory):
+    """The tiny checkpoint quantised to 8 bits by mlx-lm, with serve_config.json and the chat
+    template copied and no label_rows.lightning (as the community MLX builds ship)."""
+    import shutil
+
+    from mlx_lm.convert import convert
+
+    path = tmp_path_factory.mktemp("h2o-mlx-q8") / "q8"
+    convert(str(ckpt), mlx_path=str(path), quantize=True, q_bits=8, q_group_size=32)
+    for name in ("serve_config.json", "chat_template.jinja", "tokenizer_config.json"):
+        if (ckpt / name).exists():
+            shutil.copy(ckpt / name, path / name)
+    (path / "label_rows.lightning").unlink(missing_ok=True)
+    assert h2o.is_mlx_quantised(str(path))
+    return path
+
+
+def _tokenizer_grouped_torch_one_way(ckpt):
+    """torch's one-way reading of the unquantised checkpoint with the labels' token ids taken from
+    the tokenizer, as a checkpoint without label rows is read."""
+    torch_engine = h2o.load_h2o_engine(str(ckpt), device="cpu", attention="one-way")
+    return h2o.H2OEngine(
+        serve_config=torch_engine.serve_config,
+        label_rows=None,
+        tokenizer=torch_engine.tok,
+        backend=torch_engine.backend,
+        attention="one-way",
+        config=h2o.H2OEngineConfig(device="cpu"),
+        max_length=torch_engine.max_length,
+    )
+
+
+def test_a_quantised_build_reads_one_way_by_default_and_answers_near_torch(ckpt, quantised_ckpt):
+    """Without attention, the quantised build reads one-way and answers; 8-bit weights stay within
+    0.05 of torch's one-way probabilities of the unquantised weights."""
+    engine = h2o_mlx.load(str(quantised_ckpt))
+    assert engine.attention == "one-way" and engine.label_rows is None
+    request = SystemOneRequest(state=STATE, questions=QUESTIONS)
+    got = _probabilities(engine.evaluate(request))
+    want = _probabilities(_tokenizer_grouped_torch_one_way(ckpt).evaluate(request))
+    for name in want:
+        assert got[name] == pytest.approx(want[name], abs=0.05), name
+
+
+def test_a_quantised_build_without_label_rows_refuses_two_way(quantised_ckpt):
+    """Two-way needs label_rows.lightning; asking for it on a build without one is refused."""
+    with pytest.raises(ValueError, match=r"no label_rows\.lightning.*two-way"):
+        h2o_mlx.load(str(quantised_ckpt), "two-way")
+
+
+def test_the_output_rows_of_a_float_checkpoint_are_unchanged(ckpt):
+    """Reading output rows through the embedding gives exactly the embedding weight's rows."""
+    import mlx.core as mx
+
+    engine = h2o_mlx.load(str(ckpt), "one-way")
+    ids = [3, 5, 9]
+    want = engine.backend.decoder.embed_tokens.weight[mx.array(ids)].astype(mx.float32)
+    got = engine.backend.output_rows(ids)
+    assert got.tolist() == pytest.approx(want.tolist(), abs=0)
+
+
+def test_ask_answers_from_a_quantised_build_on_mlx(quantised_ckpt, monkeypatch):
+    """`ask --device mlx` answers from the quantised build (one-way by default)."""
+    import json
+
+    from test_h2o import ASK, _ask
+
+    args = [str(quantised_ckpt), *[a if a != "cpu" else "mlx" for a in ASK], "--json"]
+    result = _ask(args, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert set(json.loads(result.output)) == {"model", "answers", "usage"}
